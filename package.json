@@ -19,5 +19,9 @@
     "recharts": "^2.15.1",
     "xlsx": "^0.18.5"
   },
-  "devDependencies": {}
+  "devDependencies": {},
+  "engines": {
+    "node": "20.x",
+    "npm": "10.x"
+  }
 }
