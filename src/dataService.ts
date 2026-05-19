@@ -2,7 +2,12 @@ import type { AppData, DataTableName } from './types';
 import { emptyData, sampleData } from './sampleData';
 import { supabase, supabaseConfigured } from './supabaseClient';
 
-const STORAGE_KEY = 'step_shutdown_control_data_v2_imported_2026';
+// v3 força uma nova carga no navegador e evita reaproveitar caches antigos vazios.
+const STORAGE_KEY = 'step_shutdown_control_data_v3_imported_resilient_2026';
+const LEGACY_KEYS = [
+  'step_shutdown_control_data',
+  'step_shutdown_control_data_v2_imported_2026',
+];
 
 const tableMap: Record<keyof AppData, string> = {
   shutdowns: 'shutdowns',
@@ -34,41 +39,85 @@ const fromDb = (row: any) => {
 };
 
 function hasCoreData(data: AppData) {
-  return Boolean(data.shutdowns?.length || data.team?.length || data.tools?.length || data.phases?.length || data.poBsps?.length || data.progress?.length);
+  return Boolean(
+    data.shutdowns?.length ||
+    data.team?.length ||
+    data.tools?.length ||
+    data.phases?.length ||
+    data.poBsps?.length ||
+    data.progress?.length
+  );
+}
+
+function normalized(data: Partial<AppData> | null | undefined): AppData {
+  return { ...emptyData, ...(data ?? {}) } as AppData;
+}
+
+function seedLocal(): AppData {
+  localStorage.setItem(STORAGE_KEY, JSON.stringify(sampleData));
+  return sampleData;
 }
 
 function readLocal(): AppData {
   const raw = localStorage.getItem(STORAGE_KEY);
-  if (!raw) {
-    localStorage.setItem(STORAGE_KEY, JSON.stringify(sampleData));
-    return sampleData;
-  }
-  try {
-    const parsed = { ...emptyData, ...JSON.parse(raw) } as AppData;
-    if (!hasCoreData(parsed)) {
-      localStorage.setItem(STORAGE_KEY, JSON.stringify(sampleData));
-      return sampleData;
+  if (raw) {
+    try {
+      const parsed = normalized(JSON.parse(raw));
+      if (hasCoreData(parsed)) return parsed;
+    } catch (err) {
+      console.warn('Cache local inválido. Recarregando carga importada.', err);
     }
-    return parsed;
-  } catch {
-    localStorage.setItem(STORAGE_KEY, JSON.stringify(sampleData));
-    return sampleData;
   }
+
+  // Tenta aproveitar caches antigos somente se tiverem dados reais.
+  for (const key of LEGACY_KEYS) {
+    const legacy = localStorage.getItem(key);
+    if (!legacy) continue;
+    try {
+      const parsed = normalized(JSON.parse(legacy));
+      if (hasCoreData(parsed)) {
+        localStorage.setItem(STORAGE_KEY, JSON.stringify(parsed));
+        return parsed;
+      }
+    } catch {
+      // ignora cache antigo inválido
+    }
+  }
+
+  return seedLocal();
 }
 
 function writeLocal(data: AppData) {
-  localStorage.setItem(STORAGE_KEY, JSON.stringify(data));
+  localStorage.setItem(STORAGE_KEY, JSON.stringify(normalized(data)));
 }
 
-async function saveRemote(data: AppData): Promise<void> {
-  if (!supabaseConfigured || !supabase) return;
-  for (const key of Object.keys(tableMap) as Array<keyof AppData>) {
-    const table = tableMap[key];
-    const rows = (data[key] as any[]).map(toDb);
-    if (rows.length) {
-      const { error } = await supabase.from(table).upsert(rows, { onConflict: 'id' });
-      if (error) throw error;
+async function trySaveRemote(data: AppData): Promise<boolean> {
+  if (!supabaseConfigured || !supabase) return false;
+  try {
+    for (const key of Object.keys(tableMap) as Array<keyof AppData>) {
+      const table = tableMap[key];
+      const rows = ((data[key] as any[]) ?? []).map(toDb);
+      if (rows.length) {
+        const { error } = await supabase.from(table).upsert(rows, { onConflict: 'id' });
+        if (error) throw error;
+      }
     }
+    return true;
+  } catch (err) {
+    console.warn('Supabase indisponível ou schema incompleto. Dados preservados localmente.', err);
+    return false;
+  }
+}
+
+async function tryRemoveRemote<T extends DataTableName>(table: T, id: string): Promise<boolean> {
+  if (!supabaseConfigured || !supabase) return false;
+  try {
+    const { error } = await supabase.from(tableMap[table]).delete().eq('id', id);
+    if (error) throw error;
+    return true;
+  } catch (err) {
+    console.warn('Não foi possível remover no Supabase. Remoção mantida localmente.', err);
+    return false;
   }
 }
 
@@ -76,41 +125,59 @@ export const dataService = {
   supabaseConfigured,
 
   async loadAll(): Promise<AppData> {
-    if (!supabaseConfigured || !supabase) return readLocal();
-    const next: AppData = { ...emptyData };
-    for (const key of Object.keys(tableMap) as Array<keyof AppData>) {
-      const { data, error } = await supabase.from(tableMap[key]).select('*').order('created_at', { ascending: false, nullsFirst: false });
-      if (error) throw error;
-      (next as any)[key] = (data ?? []).map(fromDb);
+    const localFallback = readLocal();
+
+    // Se não tiver Supabase, usa a carga importada imediatamente.
+    if (!supabaseConfigured || !supabase) return localFallback;
+
+    try {
+      const next: AppData = { ...emptyData };
+      for (const key of Object.keys(tableMap) as Array<keyof AppData>) {
+        const { data, error } = await supabase
+          .from(tableMap[key])
+          .select('*')
+          .order('created_at', { ascending: false, nullsFirst: false });
+        if (error) throw error;
+        (next as any)[key] = (data ?? []).map(fromDb);
+      }
+
+      // Supabase acessível, mas vazio: mostra a carga importada e tenta semear o banco em segundo plano.
+      if (!hasCoreData(next)) {
+        trySaveRemote(localFallback).catch(() => undefined);
+        return localFallback;
+      }
+
+      writeLocal(next);
+      return next;
+    } catch (err) {
+      // Ponto principal da correção: erro de rede / TypeError Failed to fetch não pode zerar o painel.
+      console.warn('Falha ao consultar Supabase. Usando carga importada/local.', err);
+      return localFallback;
     }
-    if (!hasCoreData(next)) {
-      const fallback = readLocal();
-      saveRemote(fallback).catch((err) => console.warn('Não foi possível semear o Supabase automaticamente:', err));
-      return fallback;
-    }
-    return next;
   },
 
   async saveAll(data: AppData): Promise<void> {
     writeLocal(data);
-    await saveRemote(data);
+    await trySaveRemote(data);
   },
 
   async upsert<T extends DataTableName>(table: T, row: AppData[T][number]) {
+    writeLocal({ ...readLocal(), [table]: [row, ...(readLocal()[table] as any[]).filter((r: any) => r.id !== (row as any).id)] } as AppData);
     if (!supabaseConfigured || !supabase) return;
-    const { error } = await supabase.from(tableMap[table]).upsert(toDb(row), { onConflict: 'id' });
-    if (error) throw error;
+    try {
+      const { error } = await supabase.from(tableMap[table]).upsert(toDb(row), { onConflict: 'id' });
+      if (error) throw error;
+    } catch (err) {
+      console.warn('Não foi possível sincronizar registro no Supabase. Registro preservado localmente.', err);
+    }
   },
 
   async remove<T extends DataTableName>(table: T, id: string) {
-    if (!supabaseConfigured || !supabase) return;
-    const { error } = await supabase.from(tableMap[table]).delete().eq('id', id);
-    if (error) throw error;
+    await tryRemoveRemote(table, id);
   },
 
   resetLocalDemo() {
-    writeLocal(sampleData);
-    return sampleData;
+    return seedLocal();
   },
 
   clearLocal() {

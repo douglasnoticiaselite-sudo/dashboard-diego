@@ -684,7 +684,7 @@ function SettingsPage({ data, setData }: { data: AppData; setData: (d: AppData) 
     <section className="page-section">
       <div className="page-header"><div><p className="eyebrow">Administração</p><h1>Configurações</h1><p>Configuração de banco, carga importada, backup e instruções de implantação.</p></div></div>
       <div className="grid two">
-        <div className="panel"><h2>Status do banco</h2><p className="muted">{dataService.supabaseConfigured ? 'Supabase configurado. Os dados serão gravados no banco.' : 'Supabase não configurado. O sistema está usando a carga importada no localStorage.'}</p><code>VITE_SUPABASE_URL<br />VITE_SUPABASE_ANON_KEY</code></div>
+        <div className="panel"><h2>Status do banco</h2><p className="muted">{dataService.supabaseConfigured ? 'Supabase configurado. Se o banco falhar, o painel usa automaticamente a carga importada local.' : 'Supabase não configurado. O sistema está usando a carga importada no localStorage.'}</p><code>VITE_SUPABASE_URL<br />VITE_SUPABASE_ANON_KEY</code></div>
         <div className="panel"><h2>Ações locais</h2><div className="vertical-actions"><button className="btn ghost" onClick={() => { const reset = dataService.resetLocalDemo(); setData(reset); }}><RefreshCw size={16} /> Recarregar dados importados</button><button className="btn ghost danger-text" onClick={() => { if (confirm('Limpar dados locais?')) setData(dataService.clearLocal()); }}><Trash2 size={16} /> Limpar localStorage</button><button className="btn primary" onClick={() => exportFullWorkbook(data, 'backup-step-shutdown-control.xlsx')}><Download size={16} /> Gerar backup Excel</button></div></div>
       </div>
       <div className="panel"><h2>Como colocar no ar</h2><ol className="steps"><li>Crie um projeto no Supabase.</li><li>Execute o arquivo <strong>supabase/schema.sql</strong> no SQL Editor.</li><li>No Netlify, configure <strong>VITE_SUPABASE_URL</strong> e <strong>VITE_SUPABASE_ANON_KEY</strong>.</li><li>Suba o projeto no GitHub e conecte no Netlify.</li><li>Comando de build: <strong>npm run build</strong>; pasta publish: <strong>dist</strong>.</li></ol></div>
@@ -700,16 +700,30 @@ function App() {
 
   useEffect(() => {
     dataService.loadAll()
-      .then(setData)
-      .catch((err) => setError(err.message ?? String(err)))
+      .then((loaded) => {
+        setData(loaded);
+        setError('');
+      })
+      .catch((err) => {
+        console.warn('Falha inesperada ao carregar dados. Recarregando carga importada.', err);
+        const fallback = dataService.resetLocalDemo();
+        setData(fallback);
+        setError('O Supabase não respondeu, então o painel carregou a base importada localmente.');
+      })
       .finally(() => setLoading(false));
   }, []);
 
   const saveAll = async () => {
     const next = { ...data, auditLogs: [makeAudit('Sistema', 'all', 'Salvamento manual', 'Usuário acionou salvar tudo.'), ...data.auditLogs] };
     setData(next);
-    await dataService.saveAll(next);
-    alert('Dados salvos com sucesso.');
+    try {
+      await dataService.saveAll(next);
+      setError('');
+      alert('Dados salvos com sucesso.');
+    } catch (err) {
+      console.warn('Falha ao sincronizar. Dados preservados localmente.', err);
+      setError('Os dados foram preservados localmente, mas o Supabase não respondeu agora.');
+    }
   };
 
   const content = useMemo(() => {
