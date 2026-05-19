@@ -2,7 +2,7 @@ import type { AppData, DataTableName } from './types';
 import { emptyData, sampleData } from './sampleData';
 import { supabase, supabaseConfigured } from './supabaseClient';
 
-const STORAGE_KEY = 'step_shutdown_control_data_v1';
+const STORAGE_KEY = 'step_shutdown_control_data_v2_imported_2026';
 
 const tableMap: Record<keyof AppData, string> = {
   shutdowns: 'shutdowns',
@@ -33,6 +33,10 @@ const fromDb = (row: any) => {
   return out;
 };
 
+function hasCoreData(data: AppData) {
+  return Boolean(data.shutdowns?.length || data.team?.length || data.tools?.length || data.phases?.length || data.poBsps?.length || data.progress?.length);
+}
+
 function readLocal(): AppData {
   const raw = localStorage.getItem(STORAGE_KEY);
   if (!raw) {
@@ -40,7 +44,12 @@ function readLocal(): AppData {
     return sampleData;
   }
   try {
-    return { ...emptyData, ...JSON.parse(raw) } as AppData;
+    const parsed = { ...emptyData, ...JSON.parse(raw) } as AppData;
+    if (!hasCoreData(parsed)) {
+      localStorage.setItem(STORAGE_KEY, JSON.stringify(sampleData));
+      return sampleData;
+    }
+    return parsed;
   } catch {
     localStorage.setItem(STORAGE_KEY, JSON.stringify(sampleData));
     return sampleData;
@@ -49,6 +58,18 @@ function readLocal(): AppData {
 
 function writeLocal(data: AppData) {
   localStorage.setItem(STORAGE_KEY, JSON.stringify(data));
+}
+
+async function saveRemote(data: AppData): Promise<void> {
+  if (!supabaseConfigured || !supabase) return;
+  for (const key of Object.keys(tableMap) as Array<keyof AppData>) {
+    const table = tableMap[key];
+    const rows = (data[key] as any[]).map(toDb);
+    if (rows.length) {
+      const { error } = await supabase.from(table).upsert(rows, { onConflict: 'id' });
+      if (error) throw error;
+    }
+  }
 }
 
 export const dataService = {
@@ -62,23 +83,17 @@ export const dataService = {
       if (error) throw error;
       (next as any)[key] = (data ?? []).map(fromDb);
     }
-    if (!next.shutdowns.length) return readLocal();
+    if (!hasCoreData(next)) {
+      const fallback = readLocal();
+      saveRemote(fallback).catch((err) => console.warn('Não foi possível semear o Supabase automaticamente:', err));
+      return fallback;
+    }
     return next;
   },
 
   async saveAll(data: AppData): Promise<void> {
-    if (!supabaseConfigured || !supabase) {
-      writeLocal(data);
-      return;
-    }
-    for (const key of Object.keys(tableMap) as Array<keyof AppData>) {
-      const table = tableMap[key];
-      const rows = (data[key] as any[]).map(toDb);
-      if (rows.length) {
-        const { error } = await supabase.from(table).upsert(rows, { onConflict: 'id' });
-        if (error) throw error;
-      }
-    }
+    writeLocal(data);
+    await saveRemote(data);
   },
 
   async upsert<T extends DataTableName>(table: T, row: AppData[T][number]) {
